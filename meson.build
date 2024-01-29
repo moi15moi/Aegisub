@@ -325,6 +325,13 @@ if host_machine.system() == 'windows'
         # Windows 8 not required if XAudio2 is disabled. revert for compat.
         add_project_arguments('-D_WIN32_WINNT=0x0601', language: 'cpp')
     endif
+
+    if cc.has_header('windows.h')
+        deps += cc.find_library('dwrite', required: true)
+    else
+        error('DirectWrite is needed, but required header is missing.')
+    endif
+
 endif
 
 if host_machine.system() == 'darwin'

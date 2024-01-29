@@ -193,6 +193,13 @@ elif host_machine.system() == 'windows'
         error('Missing Windows SDK Uniscribe Library (usp10.h / usp10.lib)')
     endif
 
+    if cc.has_header('pathcch.h')
+        deps += cc.find_library('Pathcch', required: true)
+    else
+        error('DirectWrite is needed, but required header is missing.')
+    endif
+
+
     res_inc = include_directories('bitmaps/windows')
     res_dep_files = files(
         'bitmaps/windows/icon.ico',

@@ -24,160 +24,85 @@
 #include <libaegisub/log.h>
 
 #include <ShlObj.h>
+#include <shlwapi.h>
 #include <boost/scope_exit.hpp>
 #include <unicode/utf16.h>
 #include <Usp10.h>
-
-static void read_fonts_from_key(HKEY hkey, agi::fs::path font_dir, std::vector<agi::fs::path> &files) {
-	static const auto fonts_key_name = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts";
-	
-	HKEY key;
-	auto ret = RegOpenKeyExW(hkey, fonts_key_name, 0, KEY_QUERY_VALUE, &key);
-	if (ret != ERROR_SUCCESS) return;
-	BOOST_SCOPE_EXIT_ALL(=) { RegCloseKey(key); };
-
-	DWORD name_buf_size = SHRT_MAX;
-	DWORD data_buf_size = MAX_PATH;
-
-	auto font_name = new wchar_t[name_buf_size];
-	auto font_filename = new wchar_t[data_buf_size];
-
-	for (DWORD i = 0;; ++i) {
-retry:
-		DWORD name_len = name_buf_size;
-		DWORD data_len = data_buf_size;
-
-		ret = RegEnumValueW(key, i, font_name, &name_len, NULL, NULL, reinterpret_cast<BYTE*>(font_filename), &data_len);
-		if (ret == ERROR_MORE_DATA) {
-			data_buf_size = data_len;
-			delete font_filename;
-			font_filename = new wchar_t[data_buf_size];
-			goto retry;
-		}
-		if (ret == ERROR_NO_MORE_ITEMS) break;
-		if (ret != ERROR_SUCCESS) continue;
-
-		agi::fs::path font_path(font_filename);
-		if (!agi::fs::FileExists(font_path))
-			// Doesn't make a ton of sense to do this with user fonts, but they seem to be stored as full paths anyway
-			font_path = font_dir / font_path;
-		if (agi::fs::FileExists(font_path)) // The path might simply be invalid
-			files.push_back(font_path);
-	}
-
-	delete font_name;
-	delete font_filename;
-}
-
-namespace {
-uint32_t murmur3(const char *data, uint32_t len) {
-	static const uint32_t c1 = 0xcc9e2d51;
-	static const uint32_t c2 = 0x1b873593;
-	static const uint32_t r1 = 15;
-	static const uint32_t r2 = 13;
-	static const uint32_t m = 5;
-	static const uint32_t n = 0xe6546b64;
-
-	uint32_t hash = 0;
-
-	const int nblocks = len / 4;
-	auto blocks = reinterpret_cast<const uint32_t *>(data);
-	for (uint32_t i = 0; i * 4 < len; ++i) {
-		uint32_t k = blocks[i];
-		k *= c1;
-		k = _rotl(k, r1);
-		k *= c2;
-
-		hash ^= k;
-		hash = _rotl(hash, r2) * m + n;
-	}
-
-	hash ^= len;
-	hash ^= hash >> 16;
-	hash *= 0x85ebca6b;
-	hash ^= hash >> 13;
-	hash *= 0xc2b2ae35;
-	hash ^= hash >> 16;
-
-	return hash;
-}
-
-std::vector<agi::fs::path> get_installed_fonts() {
-	std::vector<agi::fs::path> files;
-
-	wchar_t fdir[MAX_PATH];
-	SHGetFolderPathW(NULL, CSIDL_FONTS, NULL, 0, fdir);
-	agi::fs::path font_dir(fdir);
-
-	// System fonts
-	read_fonts_from_key(HKEY_LOCAL_MACHINE, font_dir, files);
-
-	// User fonts
-	read_fonts_from_key(HKEY_CURRENT_USER, font_dir, files);
-
-	return files;
-}
-
-using font_index = std::unordered_multimap<uint32_t, agi::fs::path>;
-
-font_index index_fonts(FontCollectorStatusCallback &cb) {
-	font_index hash_to_path;
-	auto fonts = get_installed_fonts();
-	std::unique_ptr<char[]> buffer(new char[1024]);
-	for (auto const& path : fonts) {
-		try {
-			auto stream = agi::io::Open(path, true);
-			stream->read(&buffer[0], 1024);
-			auto hash = murmur3(&buffer[0], stream->tellg());
-			hash_to_path.emplace(hash, path);
-		}
-		catch (agi::Exception const& e) {
-			cb(to_wx(e.GetMessage() + "\n"), 3);
-		}
-	}
-	return hash_to_path;
-}
-
-void get_font_data(std::string& buffer, HDC dc) {
-	buffer.clear();
-
-	// For ttc files we have to ask for the "ttcf" table to get the complete file
-	DWORD ttcf = 0x66637474;
-	auto size = GetFontData(dc, ttcf, 0, nullptr, 0);
-	if (size == GDI_ERROR) {
-		ttcf = 0;
-		size = GetFontData(dc, 0, 0, nullptr, 0);
-	}
-	if (size == GDI_ERROR || size == 0)
-		return;
-
-	buffer.resize(size);
-	GetFontData(dc, ttcf, 0, &buffer[0], size);
-}
-}
+#include <dwrite.h>
+#include <windowsx.h>
+#include <string.h>
+#include <pathcch.h>
 
 GdiFontFileLister::GdiFontFileLister(FontCollectorStatusCallback &cb)
-: dc(CreateCompatibleDC(nullptr), [](HDC dc) { DeleteDC(dc); })
+: dwrite_factory_sh(nullptr, [](IDWriteFactory* p) { p->Release(); })
+, font_collection_sh(nullptr, [](IDWriteFontCollection* p) { p->Release(); })
+, dc_sh(nullptr, [](HDC dc) { DeleteDC(dc); })
+, gdi_interop_sh(nullptr, [](IDWriteGdiInterop* p) { p->Release(); })
+, test(cb)
 {
-	cb(_("Updating font cache\n"), 0);
-	index = index_fonts(cb);
+	HRESULT hr;
+	test(_("Creation GdiFontFileLister\n"), 0);
+
+	IDWriteFactory* dwrite_factory;
+	hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(&dwrite_factory));
+	if (FAILED(hr))
+	{
+		test(_("Fails DWriteCreateFactory\n"), 0);
+		throw agi::EnvironmentError("Failed to initialize the DirectWrite Factory");
+	}
+	dwrite_factory_sh = dwrite_factory;
+
+	IDWriteFontCollection* font_collection;
+	hr = dwrite_factory_sh->GetSystemFontCollection(&font_collection, true);
+	if (FAILED(hr))
+	{
+		test(_("Fails IDWriteFontCollection\n"), 0);
+		throw agi::EnvironmentError("Failed to initialize the system font collection");
+	}
+	font_collection_sh = font_collection;
+
+	HDC dc = CreateCompatibleDC(nullptr);
+	if (dc == NULL) {
+		test(_("Fails CreateCompatibleDC\n"), 0);
+		throw agi::EnvironmentError("Failed to initialize the HDC");
+	}
+	dc_sh = dc;
+
+	IDWriteGdiInterop* gdi_interop;
+	hr = dwrite_factory_sh->GetGdiInterop(&gdi_interop);
+	if (FAILED(hr))
+	{
+		test(_("Fails IDWriteGdiInterop\n"), 0);
+		throw agi::EnvironmentError("Failed to initialize the Gdi Interop");
+	}
+	gdi_interop_sh = gdi_interop;
 }
+
 
 CollectionResult GdiFontFileLister::GetFontPaths(std::string const& facename, int bold, bool italic, std::vector<int> const& characters) {
 	CollectionResult ret;
 
+	int weight = bold == 0 ? 400 :
+				 bold == 1 ? 700 :
+				 bold;
+
+	// From https://sourceforge.net/p/guliverkli2/code/HEAD/tree/src/subtitles/RTS.cpp#l45
+	// AND https://sourceforge.net/p/guliverkli2/code/HEAD/tree/src/subtitles/STS.cpp#l2992
 	LOGFONTW lf{};
-	lf.lfCharSet = DEFAULT_CHARSET;
+	lf.lfCharSet = DEFAULT_CHARSET; // in the best world, we should use the one specified in the ass file
 	wcsncpy(lf.lfFaceName, agi::charset::ConvertW(facename).c_str(), LF_FACESIZE);
 	lf.lfItalic = italic ? -1 : 0;
-	lf.lfWeight = bold == 0 ? 400 :
-	              bold == 1 ? 700 :
-	                          bold;
+	lf.lfWeight = weight;
+	lf.lfOutPrecision = OUT_TT_PRECIS;
+	lf.lfClipPrecision = CLIP_DEFAULT_PRECIS;
+	lf.lfQuality = ANTIALIASED_QUALITY;
+	lf.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
+
 
 	// Gather all of the styles for the given family name
 	std::vector<LOGFONTW> matches;
 	using type = decltype(matches);
-	EnumFontFamiliesEx(dc, &lf, [](const LOGFONT *lf, const TEXTMETRIC *, DWORD, LPARAM lParam) -> int {
+	EnumFontFamiliesEx(dc_sh, &lf, [](const LOGFONT *lf, const TEXTMETRIC *, DWORD, LPARAM lParam) -> int {
 		reinterpret_cast<type*>(lParam)->push_back(*lf);
 		return 1;
 	}, (LPARAM)&matches, 0);
@@ -210,90 +135,146 @@ CollectionResult GdiFontFileLister::GetFontPaths(std::string const& facename, in
 		ret.fake_bold = (italic && has_italic ? !has_bold_italic : !has_bold);
 	}
 
-	// Use the family name supplied by EnumFontFamiliesEx as it may be a localized version
-	memcpy(lf.lfFaceName, matches[0].lfFaceName, LF_FACESIZE);
 
-	// Open the font and get the data for it to look up in the index
-	auto hfont = CreateFontIndirectW(&lf);
-	SelectObject(dc, hfont);
+	HFONT hfont = CreateFontIndirect(&lf);
+	if (hfont == NULL) {
+		test(_("Fails CreateFontIndirect\n"), 0);
+		return ret;
+	}
 	BOOST_SCOPE_EXIT_ALL(=) {
-		SelectObject(dc, nullptr);
+		SelectObject(dc_sh, nullptr);
 		DeleteObject(hfont);
 	};
 
-	get_font_data(buffer, dc);
+	SelectFont(dc_sh, hfont);
 
-	auto range = index.equal_range(murmur3(buffer.c_str(), std::min<size_t>(buffer.size(), 1024U)));
-	if (range.first == range.second)
-		return ret; // could instead write to a temp dir
-
-	// Compare the full files for each of the fonts with the same prefix
-	std::unique_ptr<char[]> file_buffer(new char[buffer.size()]);
-	for (auto it = range.first; it != range.second; ++it) {
-		auto stream = agi::io::Open(it->second, true);
-		stream->read(&file_buffer[0], buffer.size());
-		if ((size_t)stream->tellg() != buffer.size())
-			continue;
-		if (memcmp(&file_buffer[0], &buffer[0], buffer.size()) == 0) {
-			ret.paths.push_back(it->second);
-			break;
-		}
-	}
-
-	// No fonts actually matched
-	if (ret.paths.empty())
+	HRESULT hr;
+	IDWriteFontFace* font_face;
+	hr = gdi_interop_sh->CreateFontFaceFromHdc(dc_sh, &font_face);
+	if (FAILED(hr))
+	{
+		test(_("Fails CreateFontFaceFromHdc\n"), 0);
 		return ret;
+	}
+	agi::scoped_holder<IDWriteFontFace*> font_face_sh(font_face, [](IDWriteFontFace* p) { p->Release(); });
 
-	// Convert the characters to a utf-16 string
-	std::wstring utf16characters;
-	utf16characters.reserve(characters.size());
-	for (int chr : characters) {
-		if (U16_LENGTH(chr) == 1)
-			utf16characters.push_back(static_cast<wchar_t>(chr));
-		else {
-			utf16characters.push_back(U16_LEAD(chr));
-			utf16characters.push_back(U16_TRAIL(chr));
+	
+	IDWriteFont* font;
+	hr = font_collection_sh->GetFontFromFontFace(font_face_sh, &font);
+	if (FAILED(hr))
+	{
+		test(_("Fails GetFontFromFontFace\n"), 0);
+		return ret;
+	}
+	agi::scoped_holder<IDWriteFont*> font_sh(font, [](IDWriteFont* p) { p->Release(); });
+
+
+    UINT32 file_count = 1;
+	IDWriteFontFile* font_file;
+    // DirectWrite only supports one file per face
+	hr = font_face_sh->GetFiles(&file_count, &font_file);
+	if (FAILED(hr))
+	{
+		test(_("Fails GetFiles\n"), 0);
+		return ret;
+	}
+	agi::scoped_holder<IDWriteFontFile*> font_file_sh(font_file, [](IDWriteFontFile* p) { p->Release(); });
+
+
+	LPCVOID font_file_reference_key;
+	UINT32 font_file_reference_key_size;
+	hr = font_file_sh->GetReferenceKey(&font_file_reference_key, &font_file_reference_key_size);
+	if (FAILED(hr))
+	{
+		test(_("Fails GetReferenceKey\n"), 0);
+		return ret;
+	}
+
+
+	IDWriteFontFileLoader* loader;
+	hr = font_file_sh->GetLoader(&loader);
+	if (FAILED(hr))
+	{
+		test(_("Fails GetLoader\n"), 0);
+		return ret;
+	}
+	agi::scoped_holder<IDWriteFontFileLoader*> loader_sh(loader, [](IDWriteFontFileLoader* p) { p->Release(); });
+
+
+	IDWriteLocalFontFileLoader* local_loader;
+	hr = loader->QueryInterface(__uuidof(IDWriteLocalFontFileLoader), (void**)&local_loader);
+	if (FAILED(hr))
+	{
+		test(_("Fails QueryInterface\n"), 0);
+		return ret;
+	}
+	agi::scoped_holder<IDWriteLocalFontFileLoader*> local_loader_sh(local_loader, [](IDWriteLocalFontFileLoader* p) { p->Release(); });
+
+
+	UINT32 path_length;
+	hr = local_loader_sh->GetFilePathLengthFromKey(font_file_reference_key, font_file_reference_key_size, &path_length);
+	if (FAILED(hr))
+	{
+		test(_("Fails GetFilePathLengthFromKey\n"), 0);
+		return ret;
+	}
+
+
+	WCHAR* path = new WCHAR[path_length + 1];
+	hr = local_loader_sh->GetFilePathFromKey(font_file_reference_key, font_file_reference_key_size, path, path_length + 1);
+	if (FAILED(hr))
+	{
+		test(_("Fails GetFilePathFromKey\n"), 0);
+		return ret;
+	}
+
+	test(_("Test\n"), 0);
+
+	HANDLE hfile = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if(hfile == INVALID_HANDLE_VALUE) {
+		test(_("Fails CreateFile\n"), 0);
+		return ret;
+	}
+	agi::scoped_holder<HANDLE> hfile_sh(hfile, [](HANDLE hfile) { CloseHandle(hfile);; });
+
+	DWORD normalized_path_length = GetFinalPathNameByHandle(hfile_sh, nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_NONE);
+	if (!normalized_path_length) {
+		test(_("Fails GetFinalPathNameByHandle 1\n"), 0);
+		return ret;
+	}
+
+	WCHAR* normalized_path = new WCHAR[normalized_path_length + 1];
+	normalized_path_length = GetFinalPathNameByHandle(hfile_sh, normalized_path, normalized_path_length + 1, FILE_NAME_NORMALIZED | VOLUME_NAME_NONE);
+	if (!normalized_path_length) {
+		test(_("Fails GetFinalPathNameByHandle 2\n"), 0);
+		return ret;
+	}
+	//wmemmove(normalized_path, normalized_path + 4, normalized_path_length - 3); // skip the \\?\ added by GetFinalPathNameByHandle
+
+	DWORD normalized_no_path_length = GetFullPathName(normalized_path, normalized_path_length, nullptr, nullptr);
+	if (!normalized_no_path_length) {
+		test(_("Fails GetFullPathName 1\n"), 0);
+		return ret;
+	}
+
+	WCHAR* normalized_no_path = new WCHAR[normalized_no_path_length + 1];
+	normalized_path_length = GetFullPathName(normalized_path, normalized_path_length, normalized_no_path, nullptr);
+	if (!normalized_path_length) {
+		test(_("Fails GetFullPathName 2\n"), 0);
+		return ret;
+	}
+
+	// TODO normalize case
+	ret.paths.push_back(agi::fs::path(normalized_no_path));
+
+	BOOL exists;
+	for (int character : characters) {
+		hr = font_sh->HasCharacter((UINT32)character, &exists);
+		if (FAILED(hr) || !exists) {
+			ret.missing += character;
 		}
 	}
 
-	SCRIPT_CACHE cache = nullptr;
-	std::unique_ptr<WORD[]> indices(new WORD[utf16characters.size()]);
-
-	// First try to check glyph coverage with Uniscribe, since it
-	// handles non-BMP unicode characters
-	auto hr = ScriptGetCMap(dc, &cache, utf16characters.data(),
-		utf16characters.size(), 0, indices.get());
-
-	// Uniscribe doesn't like some types of fonts, so fall back to GDI
-	if (hr == E_HANDLE) {
-		GetGlyphIndicesW(dc, utf16characters.data(), utf16characters.size(),
-			indices.get(), GGI_MARK_NONEXISTING_GLYPHS);
-		for (size_t i = 0; i < utf16characters.size(); ++i) {
-			if (U16_IS_SURROGATE(utf16characters[i]))
-				continue;
-			if (indices[i] == SHRT_MAX)
-				ret.missing += utf16characters[i];
-		}
-	}
-	else if (hr == S_FALSE) {
-		for (size_t i = 0; i < utf16characters.size(); ++i) {
-			// Uniscribe doesn't report glyph indexes for non-BMP characters,
-			// so we have to call ScriptGetCMap on each individual pair to
-			// determine if it's the missing one
-			if (U16_IS_LEAD(utf16characters[i])) {
-				hr = ScriptGetCMap(dc, &cache, &utf16characters[i], 2, 0, &indices[i]);
-				if (hr == S_FALSE) {
-					ret.missing += utf16characters[i];
-					ret.missing += utf16characters[i + 1];
-				}
-				++i;
-			}
-			else if (indices[i] == 0) {
-				ret.missing += utf16characters[i];
-			}
-		}
-	}
-	ScriptFreeCache(&cache);
 
 	return ret;
 }
